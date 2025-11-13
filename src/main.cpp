@@ -1,10 +1,10 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <Adafruit_NeoPixel.h>
-#include "driver/gpio.h" // Added for GPIO_NUM_xx definitions
+#include "driver/gpio.h"
 extern "C"
 {
-#include "driver/i2s_std.h" // IDF 5.x I2S standard mode API
+#include "driver/i2s_std.h"
 }
 
 /***** ============ USER CONFIG ============ *****/
@@ -20,11 +20,17 @@ extern "C"
 
 // Audio capture config
 #define SAMPLE_RATE_HZ 16000 // 16 kHz, speech
-#define STREAM_MS 5000       // record 5 sec per START
+#define STREAM_MS 5000       // capture 5 sec of audio
 #define CAPTURE_SAMPLES 512  // samples per I2S read (32-bit containers)
 
-// BLE notify payload sizing (~5–6ms per packet at 16k mono 16-bit)
-#define BLE_PCM_BYTES_PER_NOTIFY 160 // 80 samples * 2 bytes each
+// BLE batching config
+#define NOTIFY_SAMPLES 120 // target samples per notify
+#define BLE_PCM_BYTES_PER_NOTIFY (NOTIFY_SAMPLES * sizeof(int16_t))
+#define NOTIFY_INTERVAL_MS 15 // ~15 ms between notifies
+
+// Ring buffer capacity: enough for ~6 seconds of audio (safety margin)
+// 6 s * 16000 samples/s = 96000 samples
+#define RING_CAP_SAMPLES (SAMPLE_RATE_HZ * 6)
 
 // BLE names/UUIDs
 static const char *BLE_DEVICE_NAME = "ESP32S3-Audio";
@@ -50,10 +56,12 @@ static NimBLECharacteristic *g_controlChar = nullptr;
 static NimBLECharacteristic *g_audioChar = nullptr;
 
 static volatile bool g_isConnected = false;
-static volatile bool g_wantStart = false; // flipped in callback only
-static bool g_streaming = false;          // controlled in loop
-static uint32_t g_streamEndMs = 0;
-static uint32_t g_streamStartMs = 0; // [DEBUG] track when stream started
+static volatile bool g_wantStart = false; // set only from callback
+static bool g_streaming = false;          // overall session active
+static bool g_captureActive = false;      // still pulling from I2S
+static uint32_t g_captureEndMs = 0;
+static uint32_t g_streamStartMs = 0;
+static uint32_t g_nextNotifyMs = 0;
 static portMUX_TYPE g_stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // I2S (STD driver)
@@ -62,48 +70,91 @@ static bool g_i2sReady = false;
 
 // Buffers
 static int32_t g_i2sBuf32[CAPTURE_SAMPLES];             // 32-bit raw samples
-static int16_t g_pcm16Buf[CAPTURE_SAMPLES];             // converted 16-bit samples for BLE
-static uint8_t g_bleFrag[4 + BLE_PCM_BYTES_PER_NOTIFY]; // BLE notification buffer (header + audio)
-static uint16_t g_seq = 0;                              // sequence counter for BLE packets
+static int16_t g_pcm16Buf[CAPTURE_SAMPLES];             // converted 16-bit samples
+static uint8_t g_bleFrag[4 + BLE_PCM_BYTES_PER_NOTIFY]; // BLE packet buffer
+static uint16_t g_seq = 0;                              // BLE sequence counter
 
-// [DEBUG] counters to understand how much we actually send
-static uint32_t g_totalSamplesSent = 0; // total int16 samples sent over BLE this stream
-static uint32_t g_totalNotifies = 0;    // total BLE notifications sent this stream
-static uint32_t g_totalI2SReads = 0;    // total I2S read calls this stream
+// Ring buffer for PCM16
+static int16_t g_ringBuf[RING_CAP_SAMPLES];
+static uint32_t g_ringWriteIdx = 0;
+static uint32_t g_ringReadIdx = 0;
+static uint32_t g_ringCount = 0;      // samples currently in ring
+static uint32_t g_droppedSamples = 0; // if ring overflows
+
+// Debug counters
+static uint32_t g_totalSamplesSent = 0; // total int16 samples sent over BLE
+static uint32_t g_totalNotifies = 0;    // total BLE notifications sent
+static uint32_t g_totalI2SReads = 0;    // total I2S read calls
+
+/***** ============ RING BUFFER HELPERS ============ *****/
+
+static inline void ringClear()
+{
+  g_ringWriteIdx = 0;
+  g_ringReadIdx = 0;
+  g_ringCount = 0;
+  g_droppedSamples = 0;
+}
+
+// Push n samples into ring (dropping if full)
+static void ringPushSamples(const int16_t *src, int n)
+{
+  for (int i = 0; i < n; ++i)
+  {
+    if (g_ringCount >= RING_CAP_SAMPLES)
+    {
+      // ring full – drop sample
+      g_droppedSamples++;
+      continue;
+    }
+    g_ringBuf[g_ringWriteIdx] = src[i];
+    g_ringWriteIdx = (g_ringWriteIdx + 1) % RING_CAP_SAMPLES;
+    g_ringCount++;
+  }
+}
+
+// Pop up to maxSamples into dst, return actual count popped
+static int ringPopSamples(int16_t *dst, int maxSamples)
+{
+  int n = 0;
+  while (n < maxSamples && g_ringCount > 0)
+  {
+    dst[n++] = g_ringBuf[g_ringReadIdx];
+    g_ringReadIdx = (g_ringReadIdx + 1) % RING_CAP_SAMPLES;
+    g_ringCount--;
+  }
+  return n;
+}
 
 /***** ============ I2S (IDF 5.x STD) ============ *****/
 
 static void i2sInitStd()
 {
-  // Configure and allocate an I2S RX channel (master mode, uses I2S0)
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  chan_cfg.dma_desc_num = 8; // deeper DMA to tolerate BLE delays
+  chan_cfg.dma_desc_num = 8;
   chan_cfg.dma_frame_num = CAPTURE_SAMPLES;
   ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &g_i2sRx));
 
-  // Set up standard I2S configuration (clock, slot, GPIO)
   i2s_std_config_t std_cfg = {
-      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE_HZ),                // 16 kHz sample rate
-      .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, // 32-bit data container
-                                                  I2S_SLOT_MODE_MONO),      // mono mode
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE_HZ),
+      .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
+                                                  I2S_SLOT_MODE_MONO),
       .gpio_cfg = {
-          .mclk = I2S_GPIO_UNUSED, // MCLK not used
-          .bclk = PIN_I2S_BCLK,    // Bit Clock line
-          .ws = PIN_I2S_LRCLK,     // Word Select (LR clock) line
-          .dout = I2S_GPIO_UNUSED, // Not transmitting (TX unused)
-          .din = PIN_I2S_DIN,      // Data input from mic
+          .mclk = I2S_GPIO_UNUSED,
+          .bclk = PIN_I2S_BCLK,
+          .ws = PIN_I2S_LRCLK,
+          .dout = I2S_GPIO_UNUSED,
+          .din = PIN_I2S_DIN,
           .invert_flags = {
               .mclk_inv = false,
               .bclk_inv = false,
               .ws_inv = false}}};
-  // Limit to right channel (mic is on right channel due to SEL=3V)
-  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT;
+  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; // mic on right channel
 
-  // Initialize I2S channel in standard mode with the combined config
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(g_i2sRx, &std_cfg));
   ESP_ERROR_CHECK(i2s_channel_enable(g_i2sRx));
 
-  // Perform a non-blocking dummy read to warm up the I2S DMA
+  // Warm-up read (non-blocking)
   size_t bytes_read = 0;
   (void)i2s_channel_read(g_i2sRx, g_i2sBuf32, sizeof(g_i2sBuf32), &bytes_read, 10);
 
@@ -126,7 +177,6 @@ static void i2sDeinitStd()
 
 static inline void convert32to16(const int32_t *in32, int16_t *out16, int n)
 {
-  // Convert 18-bit effective data (in 32-bit container) to 16-bit PCM
   for (int i = 0; i < n; ++i)
   {
     int32_t s = in32[i] >> 14; // downshift to ~18-bit range
@@ -145,19 +195,23 @@ class ServerCB : public NimBLEServerCallbacks
   void onConnect(NimBLEServer *, ble_gap_conn_desc *) override
   {
     g_isConnected = true;
-    setPixel(0, 255, 0); // GREEN LED when central is connected
+    setPixel(0, 255, 0);
     Serial.println("[BLE] Central connected.");
   }
+
   void onDisconnect(NimBLEServer *) override
   {
     g_isConnected = false;
-    // Safely reset streaming state on disconnect
+
     portENTER_CRITICAL(&g_stateMux);
     g_wantStart = false;
     portEXIT_CRITICAL(&g_stateMux);
+
     g_streaming = false;
+    g_captureActive = false;
     i2sDeinitStd();
-    setPixel(0, 0, 255); // BLUE LED for advertising state
+    ringClear();
+    setPixel(0, 0, 255);
     Serial.println("[BLE] Central disconnected, advertising...");
     NimBLEDevice::startAdvertising();
   }
@@ -167,7 +221,6 @@ class ControlWriteCB : public NimBLECharacteristicCallbacks
 {
   void onWrite(NimBLECharacteristic *c) override
   {
-    // This callback runs in NimBLE stack task context; just flag the request
     std::string val = c->getValue();
     for (char &ch : val)
     {
@@ -175,12 +228,10 @@ class ControlWriteCB : public NimBLECharacteristicCallbacks
     }
     if (val.find("START") != std::string::npos)
     {
-      // Signal the main loop to start streaming
       portENTER_CRITICAL(&g_stateMux);
       g_wantStart = true;
       portEXIT_CRITICAL(&g_stateMux);
 
-      // [DEBUG] log when we actually receive START over BLE
       Serial.println("[DEBUG] [CTRL] START command received via BLE write.");
     }
   }
@@ -196,6 +247,7 @@ static void bleInit()
   g_server->setCallbacks(new ServerCB());
 
   g_service = g_server->createService(UUID_AUDIO_SERVICE);
+
   g_controlChar = g_service->createCharacteristic(
       UUID_CONTROL_CHAR,
       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
@@ -211,78 +263,47 @@ static void bleInit()
   adv->setScanResponse(true);
   adv->start();
 
-  Serial.println("[DEBUG] BLE initialized, advertising started."); // [DEBUG]
+  Serial.println("[DEBUG] BLE initialized, advertising started.");
 }
 
-/***** ============ STREAMING HELPERS ============ *****/
+/***** ============ BLE SEND (BATCHED) ============ *****/
 
-static void bleSendPcm16(const int16_t *pcm, int samples)
+static void bleSendNextChunk()
 {
   if (!g_isConnected)
     return;
   if (g_audioChar->getSubscribedCount() == 0)
     return;
+  if (g_ringCount == 0)
+    return;
 
-  const uint8_t *src = (const uint8_t *)pcm;
-  int totalBytes = samples * sizeof(int16_t);
-  int offset = 0;
-  uint32_t tick = 0;
+  // Pop up to NOTIFY_SAMPLES from ring
+  int16_t localBuf[NOTIFY_SAMPLES];
+  int samplesToSend = ringPopSamples(localBuf, NOTIFY_SAMPLES);
+  if (samplesToSend <= 0)
+    return;
 
-  // [DEBUG] local flag to detect early exit
-  bool partialSend = false;
+  uint16_t seq = g_seq++;
+  uint16_t nSamp = (uint16_t)samplesToSend;
+  uint16_t payloadBytes = nSamp * sizeof(int16_t);
 
-  while (offset < totalBytes && g_isConnected && g_streaming)
+  memcpy(g_bleFrag, &seq, sizeof(seq));
+  memcpy(g_bleFrag + 2, &nSamp, sizeof(nSamp));
+  memcpy(g_bleFrag + 4, localBuf, payloadBytes);
+
+  g_audioChar->setValue(g_bleFrag, 4 + payloadBytes);
+  g_audioChar->notify();
+
+  g_totalSamplesSent += nSamp;
+  g_totalNotifies++;
+
+  if ((g_totalNotifies % 100) == 0)
   {
-    int chunk = totalBytes - offset;
-    if (chunk > BLE_PCM_BYTES_PER_NOTIFY)
-    {
-      chunk = BLE_PCM_BYTES_PER_NOTIFY;
-    }
-    // Prepare 4-byte header: sequence (2 bytes) + sample count (2 bytes)
-    uint16_t seq = g_seq++;
-    uint16_t nSamp = chunk / 2; // number of int16 samples in this chunk
-
-    memcpy(g_bleFrag, &seq, sizeof(seq));
-    memcpy(g_bleFrag + 2, &nSamp, sizeof(nSamp));
-    memcpy(g_bleFrag + 4, src + offset, chunk);
-
-    g_audioChar->setValue(g_bleFrag, 4 + chunk);
-    g_audioChar->notify(); // send notification (non-blocking in NimBLE)
-
-    offset += chunk;
-
-    // [DEBUG] update counters
-    g_totalSamplesSent += nSamp;
-    g_totalNotifies++;
-
-    // Occasionally print progress (not every packet to avoid spam)
-    if ((g_totalNotifies % 100) == 0)
-    {
-      float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
-      Serial.printf("[DEBUG] BLE sent %lu notifies, %lu samples (~%.2f s)\n",
-                    (unsigned long)g_totalNotifies,
-                    (unsigned long)g_totalSamplesSent,
-                    secondsApprox);
-    }
-
-    // Yield periodically to avoid WDT reset
-    if ((++tick & 0x7) == 0)
-    {
-      delay(0);
-    }
-  }
-
-  if (offset < totalBytes)
-  {
-    // [DEBUG] we broke out early (disconnect or streaming flag)
-    partialSend = true;
-  }
-
-  if (partialSend)
-  {
-    Serial.printf("[DEBUG] bleSendPcm16 exited early: offset=%d totalBytes=%d, "
-                  "g_isConnected=%d g_streaming=%d\n",
-                  offset, totalBytes, (int)g_isConnected, (int)g_streaming);
+    float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
+    Serial.printf("[DEBUG] BLE sent %lu notifies, %lu samples (~%.2f s)\n",
+                  (unsigned long)g_totalNotifies,
+                  (unsigned long)g_totalSamplesSent,
+                  secondsApprox);
   }
 }
 
@@ -294,10 +315,10 @@ void setup()
   while (!Serial)
   {
     delay(10);
-  } // wait for serial port
+  }
 
   pixel.begin();
-  setPixel(0, 0, 255); // BLUE LED: waiting/advertising
+  setPixel(0, 0, 255); // BLUE: waiting/advertising
 
   Serial.println("[BOOT] Starting BLE advertising; waiting for connection...");
   bleInit();
@@ -307,106 +328,130 @@ void loop()
 {
   if (!g_isConnected)
   {
-    // Not connected to any BLE central; just idle
+    // idle when not connected
     delay(20);
     return;
   }
 
-  // If a START command was received via BLE, begin streaming
+  // Handle START command → begin new capture+stream session
   if (!g_streaming && g_wantStart)
   {
-    // Promote the request flag to actual streaming action
     portENTER_CRITICAL(&g_stateMux);
     g_wantStart = false;
     portEXIT_CRITICAL(&g_stateMux);
 
     if (!g_i2sReady)
     {
-      i2sInitStd(); // initialize I2S if not already
+      i2sInitStd();
     }
 
-    // [DEBUG] reset per-stream counters
+    // Reset ring + counters
+    ringClear();
+    g_seq = 0;
     g_totalSamplesSent = 0;
     g_totalNotifies = 0;
     g_totalI2SReads = 0;
-    g_seq = 0;
 
     g_streaming = true;
-    g_streamStartMs = millis(); // [DEBUG]
-    g_streamEndMs = g_streamStartMs + STREAM_MS;
+    g_captureActive = true;
+    g_streamStartMs = millis();
+    g_captureEndMs = g_streamStartMs + STREAM_MS;
+    g_nextNotifyMs = g_streamStartMs; // first notify can go out ASAP
 
-    setPixel(255, 0, 0); // RED LED: streaming active
-    Serial.printf("[CTRL] START received; streaming for %d ms...\n", STREAM_MS);
-    Serial.printf("[DEBUG] Stream window: start=%lu end=%lu\n",
+    setPixel(255, 0, 0); // RED: active capture/stream
+    Serial.printf("[CTRL] START received; capturing for %d ms...\n", STREAM_MS);
+    Serial.printf("[DEBUG] Capture window: start=%lu end=%lu\n",
                   (unsigned long)g_streamStartMs,
-                  (unsigned long)g_streamEndMs);
+                  (unsigned long)g_captureEndMs);
   }
 
-  if (g_streaming)
+  if (!g_streaming)
   {
-    // Check if time limit reached
-    if ((int32_t)(millis() - g_streamEndMs) >= 0)
+    // connected but idle
+    delay(10);
+    return;
+  }
+
+  uint32_t now = millis();
+
+  /***** 1) CAPTURE: read from I2S into ring while captureActive *****/
+  if (g_captureActive)
+  {
+    // End capture window?
+    if ((int32_t)(now - g_captureEndMs) >= 0)
     {
-      g_streaming = false;
+      g_captureActive = false;
       i2sDeinitStd();
-      setPixel(0, 255, 0); // GREEN LED: stream finished, idle state
 
-      uint32_t now = millis();
-      uint32_t actualDurationMs = now - g_streamStartMs;
-      float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
-
-      Serial.println("[I2S] Finished capture. Streaming done; back to idle.");
-      // [DEBUG] dump summary for this stream
-      Serial.printf("[DEBUG] Stream summary:\n");
-      Serial.printf("        actualDurationMs = %lu ms\n", (unsigned long)actualDurationMs);
-      Serial.printf("        totalI2SReads    = %lu\n", (unsigned long)g_totalI2SReads);
-      Serial.printf("        totalSamplesSent = %lu (~%.2f s at %d Hz)\n",
-                    (unsigned long)g_totalSamplesSent,
-                    secondsApprox,
-                    SAMPLE_RATE_HZ);
-      Serial.printf("        totalNotifies    = %lu\n", (unsigned long)g_totalNotifies);
-      return;
-    }
-
-    // Read a block of 32-bit samples from I2S (blocking read)
-    size_t bytesRead = 0;
-    esp_err_t ret = i2s_channel_read(g_i2sRx, g_i2sBuf32, sizeof(g_i2sBuf32), &bytesRead, portMAX_DELAY);
-    if (ret == ESP_OK && bytesRead > 0)
-    {
-      g_totalI2SReads++; // [DEBUG]
-
-      int nSamples = bytesRead / (int)sizeof(int32_t);
-      convert32to16(g_i2sBuf32, g_pcm16Buf, nSamples);
-      bleSendPcm16(g_pcm16Buf, nSamples);
-
-      // [DEBUG] Occasionally log read stats
-      if ((g_totalI2SReads % 20) == 0)
+      Serial.println("[I2S] Capture window finished; stopping I2S.");
+      if (g_droppedSamples > 0)
       {
-        Serial.printf("[DEBUG] I2S read #%lu: bytesRead=%u (nSamples=%d)\n",
-                      (unsigned long)g_totalI2SReads,
-                      (unsigned int)bytesRead,
-                      nSamples);
+        Serial.printf("[DEBUG] Ring overflow during capture, dropped %lu samples.\n",
+                      (unsigned long)g_droppedSamples);
       }
     }
     else
     {
-      // [DEBUG] In case of read error or no data, log once in a while
-      static uint32_t errCount = 0;
-      errCount++;
-      if ((errCount % 10) == 1)
+      // Non-blocking-ish read with small timeout (5 ms)
+      size_t bytesRead = 0;
+      esp_err_t ret = i2s_channel_read(g_i2sRx,
+                                       g_i2sBuf32,
+                                       sizeof(g_i2sBuf32),
+                                       &bytesRead,
+                                       5);
+      if (ret == ESP_OK && bytesRead > 0)
       {
-        Serial.printf("[DEBUG] i2s_channel_read error or zero bytes: ret=%d bytesRead=%u (count=%lu)\n",
-                      (int)ret,
-                      (unsigned int)bytesRead,
-                      (unsigned long)errCount);
+        g_totalI2SReads++;
+        int nSamples = bytesRead / (int)sizeof(int32_t);
+        convert32to16(g_i2sBuf32, g_pcm16Buf, nSamples);
+        ringPushSamples(g_pcm16Buf, nSamples);
+
+        if ((g_totalI2SReads % 20) == 0)
+        {
+          Serial.printf("[DEBUG] I2S read #%lu: bytesRead=%u (nSamples=%d), ringCount=%lu\n",
+                        (unsigned long)g_totalI2SReads,
+                        (unsigned int)bytesRead,
+                        nSamples,
+                        (unsigned long)g_ringCount);
+        }
       }
-      // In case of read error or no data, yield briefly
-      delay(1);
+      // else: timeout or error; we just skip this iteration
     }
   }
-  else
+
+  /***** 2) SEND: paced BLE notifications from ring *****/
+  if (g_isConnected &&
+      g_audioChar->getSubscribedCount() > 0 &&
+      g_ringCount > 0 &&
+      (int32_t)(now - g_nextNotifyMs) >= 0)
   {
-    // Connected but not streaming, small delay to prevent tight loop
-    delay(10);
+
+    bleSendNextChunk();
+    g_nextNotifyMs = now + NOTIFY_INTERVAL_MS;
   }
+
+  /***** 3) END OF STREAM: when capture done AND ring drained *****/
+  if (!g_captureActive && g_ringCount == 0)
+  {
+    g_streaming = false;
+    setPixel(0, 255, 0); // GREEN: finished, idle
+
+    uint32_t endMs = millis();
+    uint32_t sessionMs = endMs - g_streamStartMs;
+    float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
+
+    Serial.println("[STREAM] Finished streaming; back to idle.");
+    Serial.printf("[DEBUG] Stream summary:\n");
+    Serial.printf("        sessionDurationMs = %lu ms\n", (unsigned long)sessionMs);
+    Serial.printf("        totalI2SReads     = %lu\n", (unsigned long)g_totalI2SReads);
+    Serial.printf("        totalSamplesSent  = %lu (~%.2f s at %d Hz)\n",
+                  (unsigned long)g_totalSamplesSent,
+                  secondsApprox,
+                  SAMPLE_RATE_HZ);
+    Serial.printf("        totalNotifies     = %lu\n", (unsigned long)g_totalNotifies);
+    Serial.printf("        ringOverflowDrops = %lu\n", (unsigned long)g_droppedSamples);
+  }
+
+  // Small delay to avoid a too-tight loop
+  delay(1);
 }
