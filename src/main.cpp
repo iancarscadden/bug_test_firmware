@@ -327,10 +327,13 @@ static void bleSendNextChunk()
 void setup()
 {
   Serial.begin(115200);
-  while (!Serial)
-  {
-    delay(10);
-  }
+
+  // This while will cause the main logic to not run unless the board is connected to the serial
+  // debugger in vscode platformio extension
+  // while (!Serial)
+  // {
+  //   delay(10);
+  // }
 
   pixel.begin();
   setPixel(0, 0, 255); // BLUE: waiting/advertising
