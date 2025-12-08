@@ -19,9 +19,10 @@ extern "C"
 #define NEOPIXEL_NUM 1
 
 // Audio capture config
-#define SAMPLE_RATE_HZ 16000 // 16 kHz, speech
-// STREAM_MS was used for fixed 5s capture; now unused (continuous until STOP)
-// #define STREAM_MS 5000
+// Capture at 16kHz to keep mic clock fast enough, then downsample to 8kHz for BLE output
+#define I2S_SAMPLE_RATE_HZ 16000    // Mic capture rate (keeps BCLK ~1MHz)
+#define OUTPUT_SAMPLE_RATE_HZ 8000  // What we send over BLE to Deepgram
+
 #define CAPTURE_SAMPLES 512 // samples per I2S read (32-bit containers)
 
 // BLE batching config
@@ -29,9 +30,9 @@ extern "C"
 #define BLE_PCM_BYTES_PER_NOTIFY (NOTIFY_SAMPLES * sizeof(int16_t))
 #define NOTIFY_INTERVAL_MS 15 // ~15 ms between notifies
 
-// Ring buffer capacity: enough for ~6 seconds of audio (safety margin)
-// 6 s * 16000 samples/s = 96000 samples
-#define RING_CAP_SAMPLES (SAMPLE_RATE_HZ * 6)
+// Ring buffer capacity: enough for ~6 seconds of OUTPUT audio (safety margin)
+// 6 s * 8000 samples/s = 48000 samples
+#define RING_CAP_SAMPLES (OUTPUT_SAMPLE_RATE_HZ * 6)
 
 // BLE names/UUIDs
 static const char *BLE_DEVICE_NAME = "ESP32S3-Audio";
@@ -58,7 +59,7 @@ static NimBLECharacteristic *g_audioChar = nullptr;
 
 static volatile bool g_isConnected = false;
 static volatile bool g_wantStart = false; // set only from callback
-static volatile bool g_wantStop = false;  // NEW: STOP flag set only from callback
+static volatile bool g_wantStop = false;  // STOP flag set only from callback
 
 static bool g_streaming = false;     // overall session active (ring draining + BLE)
 static bool g_captureActive = false; // still pulling from I2S into ring
@@ -72,12 +73,12 @@ static i2s_chan_handle_t g_i2sRx = nullptr;
 static bool g_i2sReady = false;
 
 // Buffers
-static int32_t g_i2sBuf32[CAPTURE_SAMPLES];             // 32-bit raw samples
-static int16_t g_pcm16Buf[CAPTURE_SAMPLES];             // converted 16-bit samples
+static int32_t g_i2sBuf32[CAPTURE_SAMPLES];             // 32-bit raw samples from I2S
+static int16_t g_pcm16Buf[CAPTURE_SAMPLES];             // converted 16-bit samples (before downsample, same size)
 static uint8_t g_bleFrag[4 + BLE_PCM_BYTES_PER_NOTIFY]; // BLE packet buffer
 static uint16_t g_seq = 0;                              // BLE sequence counter
 
-// Ring buffer for PCM16
+// Ring buffer for PCM16 (holds downsampled 8kHz audio)
 static int16_t g_ringBuf[RING_CAP_SAMPLES];
 static uint32_t g_ringWriteIdx = 0;
 static uint32_t g_ringReadIdx = 0;
@@ -85,7 +86,7 @@ static uint32_t g_ringCount = 0;      // samples currently in ring
 static uint32_t g_droppedSamples = 0; // if ring overflows
 
 // Debug counters
-static uint32_t g_totalSamplesSent = 0; // total int16 samples sent over BLE
+static uint32_t g_totalSamplesSent = 0; // total int16 samples sent over BLE (at 8kHz)
 static uint32_t g_totalNotifies = 0;    // total BLE notifications sent
 static uint32_t g_totalI2SReads = 0;    // total I2S read calls
 
@@ -138,8 +139,9 @@ static void i2sInitStd()
   chan_cfg.dma_frame_num = CAPTURE_SAMPLES;
   ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &g_i2sRx));
 
+  // Use I2S_SAMPLE_RATE_HZ (16kHz) for the mic to keep clock speed adequate
   i2s_std_config_t std_cfg = {
-      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE_HZ),
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE_HZ),
       .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
                                                   I2S_SLOT_MODE_MONO),
       .gpio_cfg = {
@@ -162,7 +164,8 @@ static void i2sInitStd()
   (void)i2s_channel_read(g_i2sRx, g_i2sBuf32, sizeof(g_i2sBuf32), &bytes_read, 10);
 
   g_i2sReady = true;
-  Serial.println("[I2S] STD ready.");
+  Serial.printf("[I2S] STD ready at %d Hz (will downsample to %d Hz).\n", 
+                I2S_SAMPLE_RATE_HZ, OUTPUT_SAMPLE_RATE_HZ);
 }
 
 static void i2sDeinitStd()
@@ -176,19 +179,31 @@ static void i2sDeinitStd()
   g_i2sReady = false;
 }
 
-/***** ============ SAMPLE CONVERSION ============ *****/
+/***** ============ SAMPLE CONVERSION + DOWNSAMPLING ============ *****/
 
-static inline void convert32to16(const int32_t *in32, int16_t *out16, int n)
+// Convert 32-bit I2S samples to 16-bit PCM AND downsample 2:1 (16kHz -> 8kHz)
+// Takes every other sample, averaging adjacent pairs for better quality
+static void convert32to16Downsample(const int32_t *in32, int16_t *out16, int nIn, int *nOut)
 {
-  for (int i = 0; i < n; ++i)
+  int j = 0;
+  for (int i = 0; i < nIn; i += 2) // Take every other sample
   {
-    int32_t s = in32[i] >> 14; // downshift to ~18-bit range
-    if (s > 32767)
-      s = 32767;
-    else if (s < -32768)
-      s = -32768;
-    out16[i] = (int16_t)s;
+    // Shift down from 32-bit I2S format to usable range
+    int32_t s1 = in32[i] >> 14;
+    int32_t s2 = (i + 1 < nIn) ? (in32[i + 1] >> 14) : s1;
+    
+    // Average two adjacent samples for better quality downsampling
+    int32_t avg = (s1 + s2) / 2;
+
+    // Clamp to int16 range
+    if (avg > 32767)
+      avg = 32767;
+    else if (avg < -32768)
+      avg = -32768;
+
+    out16[j++] = (int16_t)avg;
   }
+  *nOut = j;
 }
 
 /***** ============ BLE ============ *****/
@@ -240,7 +255,6 @@ class ControlWriteCB : public NimBLECharacteristicCallbacks
       Serial.println("[DEBUG] [CTRL] START command received via BLE write.");
     }
 
-    // NEW: STOP handling
     if (val.find("STOP") != std::string::npos)
     {
       portENTER_CRITICAL(&g_stateMux);
@@ -314,11 +328,13 @@ static void bleSendNextChunk()
 
   if ((g_totalNotifies % 100) == 0)
   {
-    float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
-    Serial.printf("[DEBUG] BLE sent %lu notifies, %lu samples (~%.2f s)\n",
+    // Use OUTPUT_SAMPLE_RATE_HZ since that's what we're actually sending
+    float secondsApprox = (float)g_totalSamplesSent / (float)OUTPUT_SAMPLE_RATE_HZ;
+    Serial.printf("[DEBUG] BLE sent %lu notifies, %lu samples (~%.2f s at %d Hz)\n",
                   (unsigned long)g_totalNotifies,
                   (unsigned long)g_totalSamplesSent,
-                  secondsApprox);
+                  secondsApprox,
+                  OUTPUT_SAMPLE_RATE_HZ);
   }
 }
 
@@ -328,17 +344,12 @@ void setup()
 {
   Serial.begin(115200);
 
-  // This while will cause the main logic to not run unless the board is connected to the serial
-  // debugger in vscode platformio extension
-  // while (!Serial)
-  // {
-  //   delay(10);
-  // }
-
   pixel.begin();
   setPixel(0, 0, 255); // BLUE: waiting/advertising
 
   Serial.println("[BOOT] Starting BLE advertising; waiting for connection...");
+  Serial.printf("[BOOT] Audio config: capture at %d Hz, output at %d Hz (2:1 downsample)\n",
+                I2S_SAMPLE_RATE_HZ, OUTPUT_SAMPLE_RATE_HZ);
   bleInit();
 }
 
@@ -392,7 +403,7 @@ void loop()
   /***** 1) CAPTURE: read from I2S into ring while captureActive *****/
   if (g_captureActive)
   {
-    // NEW: STOP-based termination instead of time-based
+    // STOP-based termination
     if (g_wantStop)
     {
       portENTER_CRITICAL(&g_stateMux);
@@ -421,16 +432,20 @@ void loop()
       if (ret == ESP_OK && bytesRead > 0)
       {
         g_totalI2SReads++;
-        int nSamples = bytesRead / (int)sizeof(int32_t);
-        convert32to16(g_i2sBuf32, g_pcm16Buf, nSamples);
-        ringPushSamples(g_pcm16Buf, nSamples);
+        int nSamplesIn = bytesRead / (int)sizeof(int32_t);
+        int nSamplesOut = 0;
+
+        // Convert AND downsample from 16kHz to 8kHz
+        convert32to16Downsample(g_i2sBuf32, g_pcm16Buf, nSamplesIn, &nSamplesOut);
+        ringPushSamples(g_pcm16Buf, nSamplesOut);
 
         if ((g_totalI2SReads % 20) == 0)
         {
-          Serial.printf("[DEBUG] I2S read #%lu: bytesRead=%u (nSamples=%d), ringCount=%lu\n",
+          Serial.printf("[DEBUG] I2S read #%lu: bytesRead=%u (nSamplesIn=%d, nSamplesOut=%d), ringCount=%lu\n",
                         (unsigned long)g_totalI2SReads,
                         (unsigned int)bytesRead,
-                        nSamples,
+                        nSamplesIn,
+                        nSamplesOut,
                         (unsigned long)g_ringCount);
         }
       }
@@ -456,7 +471,7 @@ void loop()
 
     uint32_t endMs = millis();
     uint32_t sessionMs = endMs - g_streamStartMs;
-    float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
+    float secondsApprox = (float)g_totalSamplesSent / (float)OUTPUT_SAMPLE_RATE_HZ;
 
     Serial.println("[STREAM] Finished streaming; back to idle.");
     Serial.printf("[DEBUG] Stream summary:\n");
@@ -465,7 +480,7 @@ void loop()
     Serial.printf("        totalSamplesSent  = %lu (~%.2f s at %d Hz)\n",
                   (unsigned long)g_totalSamplesSent,
                   secondsApprox,
-                  SAMPLE_RATE_HZ);
+                  OUTPUT_SAMPLE_RATE_HZ);
     Serial.printf("        totalNotifies     = %lu\n", (unsigned long)g_totalNotifies);
     Serial.printf("        ringOverflowDrops = %lu\n", (unsigned long)g_droppedSamples);
   }
